@@ -4,6 +4,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { LiveDemoTab } from '@/components/tabs/LiveDemoTab';
 import { AnalyticsTab } from '@/components/tabs/AnalyticsTab';
 import { SystemStatusTab } from '@/components/tabs/SystemStatusTab';
+import { TicketsTab } from '@/components/tabs/TicketsTab';
 import type { WebSocketMessage } from '@/types/api';
 
 function App() {
@@ -67,9 +68,10 @@ function App() {
       {/* Main Content */}
       <main className="container mx-auto px-6 py-6">
         <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-6">
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="demo">🎬 Live Demo</TabsTrigger>
             <TabsTrigger value="analytics">📊 Analytics</TabsTrigger>
+            <TabsTrigger value="tickets">🎫 Tickets</TabsTrigger>
             <TabsTrigger value="status">⚙️ System Status</TabsTrigger>
           </TabsList>
 
@@ -79,6 +81,10 @@ function App() {
 
           <TabsContent value="analytics">
             <AnalyticsTab />
+          </TabsContent>
+
+          <TabsContent value="tickets">
+            <TicketsTab />
           </TabsContent>
 
           <TabsContent value="status">
