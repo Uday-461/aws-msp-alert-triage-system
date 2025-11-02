@@ -7,18 +7,15 @@ export default defineConfig({
   server: {
     port: 5174,
     host: '0.0.0.0',
-    strictPort: false,
-    cors: true,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8001',
         changeOrigin: true,
       }
     }
   },
   preview: {
     port: 5174,
-    host: '0.0.0.0',
-    cors: true
+    host: '0.0.0.0'
   }
 })

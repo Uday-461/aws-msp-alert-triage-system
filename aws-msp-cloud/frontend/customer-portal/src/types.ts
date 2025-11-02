@@ -15,21 +15,32 @@ export interface Conversation {
 
 export interface ChatRequest {
   message: string;
-  user_id: string;
+  customer_name?: string;
+  customer_email?: string;
   conversation_id?: string;
   openai_api_key?: string;
   openrouter_api_key?: string;
 }
 
 export interface StreamToken {
-  type: 'token';
+  type: 'chunk';
   content: string;
 }
 
-export interface StreamComplete {
-  type: 'done';
+export interface StreamMetadata {
+  type: 'metadata';
   conversation_id: string;
-  message_id: string;
+}
+
+export interface StreamComplete {
+  type: 'complete';
+  confidence: number;
+  sources: Array<{
+    id: string;
+    title: string;
+    category: string;
+    similarity: number;
+  }>;
 }
 
 export interface StreamError {
@@ -37,4 +48,4 @@ export interface StreamError {
   message: string;
 }
 
-export type StreamEvent = StreamToken | StreamComplete | StreamError;
+export type StreamEvent = StreamToken | StreamMetadata | StreamComplete | StreamError;

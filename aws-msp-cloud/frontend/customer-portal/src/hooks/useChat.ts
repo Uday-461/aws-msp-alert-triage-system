@@ -55,13 +55,13 @@ export const useChat = () => {
 
       const requestBody: ChatRequest = {
         message: content.trim(),
-        user_id: userId.current,
+        customer_name: userId.current,
         conversation_id: conversationId || undefined,
         openai_api_key: openaiApiKey || undefined,
         openrouter_api_key: openrouterApiKey || undefined,
       };
 
-      const response = await fetch('/api/chat/message', {
+      const response = await fetch('/api/chat/send/stream', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -96,8 +96,11 @@ export const useChat = () => {
             try {
               const data: StreamEvent = JSON.parse(line.slice(6));
 
-              if (data.type === 'token') {
-                // Append token to assistant message
+              if (data.type === 'metadata') {
+                // Store conversation ID from metadata event
+                setConversationId(data.conversation_id);
+              } else if (data.type === 'chunk') {
+                // Append chunk to assistant message
                 setMessages(prev =>
                   prev.map(msg =>
                     msg.id === assistantMessageId
@@ -105,9 +108,15 @@ export const useChat = () => {
                       : msg
                   )
                 );
-              } else if (data.type === 'done') {
-                // Store conversation ID
-                setConversationId(data.conversation_id);
+              } else if (data.type === 'complete') {
+                // Response complete with sources
+                setMessages(prev =>
+                  prev.map(msg =>
+                    msg.id === assistantMessageId
+                      ? { ...msg, sources: data.sources.map(s => s.title) }
+                      : msg
+                  )
+                );
                 setIsLoading(false);
               } else if (data.type === 'error') {
                 throw new Error(data.message);
