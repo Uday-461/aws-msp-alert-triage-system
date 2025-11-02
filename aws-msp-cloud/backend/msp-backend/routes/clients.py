@@ -79,7 +79,7 @@ async def list_clients():
             FROM superops.clients c
             LEFT JOIN superops.assets ast ON ast.client_id = c.id
             LEFT JOIN superops.alerts a ON a.client_id = c.id
-            LEFT JOIN superops.ml_classifications ml ON ml.alert_id = a.id::text
+            LEFT JOIN superops.ml_classifications ml ON ml.alert_id = a.alert_id
             LEFT JOIN audit.action_logs al ON al.alert_id = a.id
             GROUP BY c.id, c.client_name, c.tier
             ORDER BY c.client_name
@@ -156,7 +156,7 @@ async def get_client(client_id: str):
                 COUNT(*) FILTER (WHERE al.action = 'REVIEW') as review,
                 COUNT(*) FILTER (WHERE a.severity = 'CRITICAL') as critical
             FROM superops.alerts a
-            LEFT JOIN superops.ml_classifications ml ON ml.alert_id = a.id::text
+            LEFT JOIN superops.ml_classifications ml ON ml.alert_id = a.alert_id
             LEFT JOIN audit.action_logs al ON al.alert_id = a.id
             WHERE a.client_id = $1
               AND a.created_at >= $2
@@ -172,7 +172,7 @@ async def get_client(client_id: str):
                 COUNT(*) as total_alerts,
                 COUNT(*) FILTER (WHERE al.action = 'AUTO_SUPPRESS') as suppressed
             FROM superops.alerts a
-            LEFT JOIN superops.ml_classifications ml ON ml.alert_id = a.id::text
+            LEFT JOIN superops.ml_classifications ml ON ml.alert_id = a.alert_id
             LEFT JOIN audit.action_logs al ON al.alert_id = a.id
             WHERE a.client_id = $1
               AND a.created_at >= $2

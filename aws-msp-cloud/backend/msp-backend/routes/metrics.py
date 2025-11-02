@@ -4,7 +4,7 @@ GET /api/metrics - Get dashboard metrics (suppression rate, escalation rate, ROI
 """
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import logging
 
@@ -47,7 +47,7 @@ class MetricsResponse(BaseModel):
 
 @router.get("", response_model=MetricsResponse)
 async def get_metrics(
-    hours: int = Query(24, ge=1, le=720, description="Time range in hours (default: 24, max: 168)")
+    hours: int = Query(24, ge=1, le=168, description="Time range in hours (default: 24, max: 168)")
 ):
     """
     Get dashboard metrics and statistics
@@ -63,21 +63,21 @@ async def get_metrics(
         pool = await get_pool()
 
         # Time range
-        start_time = datetime.utcnow() - timedelta(hours=hours)
+        start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        # Get alert statistics
+        # Get alert statistics from ML classifications table
+        # Note: Querying ml_classifications directly since it has current data
+        # Mapping: NOISE/DUPLICATE → suppressed, ACTIONABLE/CRITICAL → escalated
         alert_stats_query = """
             SELECT
                 COUNT(*) as total_alerts,
-                COUNT(*) FILTER (WHERE al.action = 'AUTO_SUPPRESS') as suppressed,
-                COUNT(*) FILTER (WHERE al.action = 'ESCALATE') as escalated,
-                COUNT(*) FILTER (WHERE al.action = 'REVIEW') as review,
-                AVG(ml.total_latency_ms) as avg_latency,
-                AVG(ml.confidence) as avg_confidence
-            FROM superops.alerts a
-            LEFT JOIN superops.ml_classifications ml ON ml.alert_id = a.id::text
-            LEFT JOIN audit.action_logs al ON al.alert_id = a.id
-            WHERE a.created_at >= $1
+                COUNT(*) FILTER (WHERE classification IN ('NOISE', 'DUPLICATE')) as suppressed,
+                COUNT(*) FILTER (WHERE classification IN ('ACTIONABLE', 'CRITICAL')) as escalated,
+                COUNT(*) FILTER (WHERE classification IS NULL OR classification NOT IN ('NOISE', 'DUPLICATE', 'ACTIONABLE', 'CRITICAL')) as review,
+                AVG(total_latency_ms) as avg_latency,
+                AVG(confidence) as avg_confidence
+            FROM superops.ml_classifications
+            WHERE created_at >= $1
         """
 
         stats = await pool.fetchrow(alert_stats_query, start_time)
@@ -132,7 +132,7 @@ async def get_metrics(
             roi_annual_usd=round(roi_annual_usd, 2),
             roi_weekly_hours=round(roi_weekly_hours, 2),
             category_distribution=category_distribution,
-            calculated_at=datetime.utcnow(),
+            calculated_at=datetime.now(timezone.utc),  # Timezone-aware UTC timestamp
             time_range_hours=hours
         )
 

@@ -15,7 +15,7 @@ from prometheus_client import Counter, Histogram, generate_latest
 from fastapi.responses import Response
 
 from database import get_pool, close_pool
-from routes import alerts, metrics, clients, audit, demo, health
+from routes import alerts, metrics, clients, audit, demo, health, analytics
 
 # Configure logging
 logging.basicConfig(
@@ -164,7 +164,7 @@ app = FastAPI(
 # CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://192.168.1.7:5173"],  # MSP dashboard frontend
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://192.168.1.7:5173", "http://192.168.1.7:5174"],  # MSP dashboard frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -177,6 +177,7 @@ app.include_router(clients.router)
 app.include_router(audit.router)
 app.include_router(demo.router)
 app.include_router(health.router)
+app.include_router(analytics.router)
 
 # Health check endpoint
 @app.get("/health")
