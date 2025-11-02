@@ -1,0 +1,300 @@
+version: "3.8"
+
+networks:
+  superops_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  chromadb_data:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+  # Infrastructure
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.10
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 172.20.0.10:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://172.20.0.13:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.13
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: hackathon_db_pass
+      POSTGRES_DB: superops
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.11
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis
+    command: redis-server /usr/local/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.12
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.60
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.61
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Backend services (using pre-built images)
+  mock-superops-api:
+    image: 937170779503.dkr.ecr.us-east-2.amazonaws.com/aws-msp-mock-superops-api:latest
+    container_name: mock-superops-api
+    ports:
+      - "4000:4000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:hackathon_db_pass@172.20.0.11:5432/superops
+      - SERVICE_NAME=mock-superops-api
+      - LOG_LEVEL=INFO
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.21
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  ml-processor:
+    image: 937170779503.dkr.ecr.us-east-2.amazonaws.com/aws-msp-ml-processor:latest
+    container_name: ml-processor
+    environment:
+      - DATABASE_URL=postgresql://postgres:hackathon_db_pass@172.20.0.11:5432/superops
+      - REDIS_URL=redis://:hackathon_redis_pass@172.20.0.12:6379
+      - KAFKA_BROKER=172.20.0.13:9092
+      - SERVICE_NAME=ml-processor
+      - LOG_LEVEL=INFO
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.22
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    restart: unless-stopped
+
+  action-orchestrator:
+    image: 937170779503.dkr.ecr.us-east-2.amazonaws.com/aws-msp-action-orchestrator:latest
+    container_name: action-orchestrator
+    environment:
+      - DATABASE_URL=postgresql://postgres:hackathon_db_pass@172.20.0.11:5432/superops
+      - REDIS_URL=redis://:hackathon_redis_pass@172.20.0.12:6379
+      - KAFKA_BROKER=172.20.0.13:9092
+      - SUPEROPS_API_URL=http://172.20.0.21:4000/graphql
+      - SERVICE_NAME=action-orchestrator
+      - LOG_LEVEL=INFO
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.23
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+      - mock-superops-api
+    restart: unless-stopped
+
+  alert-generator:
+    image: 937170779503.dkr.ecr.us-east-2.amazonaws.com/aws-msp-alert-generator:latest
+    container_name: alert-generator
+    ports:
+      - "8003:8003"
+    environment:
+      - KAFKA_BROKER=172.20.0.13:9092
+      - DATABASE_URL=postgresql://postgres:hackathon_db_pass@172.20.0.11:5432/superops
+      - SERVICE_NAME=alert-generator
+      - LOG_LEVEL=INFO
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.24
+    depends_on:
+      - kafka
+      - postgres
+    restart: unless-stopped
+
+  msp-backend:
+    build:
+      context: /home/ec2-user/aws-msp-cloud/backend/msp-backend
+      dockerfile: Dockerfile
+    container_name: msp-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:hackathon_db_pass@172.20.0.11:5432/superops
+      - REDIS_URL=redis://:hackathon_redis_pass@172.20.0.12:6379
+      - KAFKA_BROKER=172.20.0.13:9092
+      - SERVICE_NAME=msp-backend
+      - LOG_LEVEL=INFO
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.30
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5.0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  msp-frontend:
+    build:
+      context: /home/ec2-user/aws-msp-cloud/frontend/msp-dashboard
+      dockerfile: Dockerfile
+    container_name: msp-frontend
+    ports:
+      - "5173:80"
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.31
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ChromaDB for RAG vector search
+  chromadb:
+    image: chromadb/chroma:0.5.5
+    container_name: chromadb
+    ports:
+      - "8005:8000"
+    volumes:
+      - /home/ec2-user/chromadb_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.20
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Chatbot API for customer support
+  chatbot-api:
+    build:
+      context: /home/ec2-user/aws-msp/backend/chatbot-api
+      dockerfile: Dockerfile
+    container_name: chatbot-api
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://postgres:hackathon_db_pass@172.20.0.11:5432/superops
+      - REDIS_URL=redis://:hackathon_redis_pass@172.20.0.12:6379
+      - CHROMA_HOST=172.20.0.20
+      - CHROMA_PORT=8000
+      - SERVICE_NAME=chatbot-api
+      - LOG_LEVEL=INFO
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    networks:
+      superops_network:
+        ipv4_address: 172.20.0.32
+    depends_on:
+      - postgres
+      - redis
+      - chromadb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8001/health', timeout=5.0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
