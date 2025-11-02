@@ -11,6 +11,7 @@ from typing import List, Optional, Dict
 import logging
 import httpx
 import asyncio
+import socket
 
 from database import get_pool
 
@@ -65,41 +66,100 @@ class DatabaseHealthResponse(BaseModel):
     checked_at: datetime
 
 
-# Service definitions
+# Service definitions with Docker network IPs
 SERVICES = [
-    {"name": "alert-generator", "type": "core", "port": 8003, "endpoint": "/health"},
-    {"name": "ml-processor", "type": "core", "port": 8001, "endpoint": "/health"},
-    {"name": "action-orchestrator", "type": "core", "port": 8002, "endpoint": "/health"},
-    {"name": "msp-backend", "type": "core", "port": 8000, "endpoint": "/health"},
-    {"name": "mock-superops-api", "type": "core", "port": 4000, "endpoint": "/graphql"},
-    {"name": "postgres", "type": "infrastructure", "port": 5432, "endpoint": None},
-    {"name": "redis", "type": "infrastructure", "port": 6379, "endpoint": None},
-    {"name": "kafka", "type": "infrastructure", "port": 9092, "endpoint": None},
-    {"name": "prometheus", "type": "infrastructure", "port": 9090, "endpoint": "/-/healthy"},
-    {"name": "grafana", "type": "infrastructure", "port": 3001, "endpoint": "/api/health"},
+    {"name": "alert-generator", "type": "core", "host": "172.20.0.24", "port": 8003, "endpoint": "/health"},
+    {"name": "ml-processor", "type": "core", "host": "172.20.0.2", "port": 8001, "endpoint": None},  # Faust - no HTTP endpoint
+    {"name": "action-orchestrator", "type": "core", "host": "172.20.0.23", "port": 8002, "endpoint": None},  # Faust - no HTTP endpoint
+    {"name": "msp-backend", "type": "core", "host": "172.20.0.30", "port": 8000, "endpoint": "/health"},
+    {"name": "mock-superops-api", "type": "core", "host": "172.20.0.21", "port": 4000, "endpoint": "/graphql"},
+    {"name": "postgres", "type": "infrastructure", "host": "172.20.0.11", "port": 5432, "endpoint": None},
+    {"name": "redis", "type": "infrastructure", "host": "172.20.0.12", "port": 6379, "endpoint": None},
+    {"name": "kafka", "type": "infrastructure", "host": "172.20.0.13", "port": 9092, "endpoint": None},
+    {"name": "prometheus", "type": "infrastructure", "host": "172.20.0.60", "port": 9090, "endpoint": "/-/healthy"},
+    {"name": "grafana", "type": "infrastructure", "host": "172.20.0.61", "port": 3001, "endpoint": None},  # Accessible via browser only
 ]
 
 
-async def check_service_health(service: dict) -> ServiceHealth:
-    """Check health of a single service"""
-    name = service["name"]
-    port = service["port"]
-    endpoint = service["endpoint"]
+async def check_tcp_health(host: str, port: int, name: str, service_type: str) -> ServiceHealth:
+    """
+    Check TCP connectivity to service (for non-HTTP services like postgres, redis, kafka)
 
-    # Infrastructure services without HTTP endpoints
-    if endpoint is None:
+    Args:
+        host: Service host IP
+        port: Service port
+        name: Service name
+        service_type: Service type (core or infrastructure)
+
+    Returns:
+        ServiceHealth with status based on TCP connectivity
+    """
+    try:
+        start_time = asyncio.get_event_loop().time()
+
+        # Run blocking socket call in executor to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3.0)
+
+        # socket.connect_ex returns 0 on success, error code otherwise
+        result = await loop.run_in_executor(
+            None,
+            sock.connect_ex,
+            (host, port)
+        )
+
+        end_time = asyncio.get_event_loop().time()
+        response_time_ms = (end_time - start_time) * 1000
+
+        sock.close()
+
         return ServiceHealth(
             name=name,
-            type=service["type"],
-            status="unknown",
+            type=service_type,
+            status="healthy" if result == 0 else "unhealthy",
+            port=port,
+            endpoint=None,
+            response_time_ms=round(response_time_ms, 2) if result == 0 else None,
+            error=None if result == 0 else f"Port {port} unreachable (TCP connect failed)"
+        )
+
+    except socket.timeout:
+        return ServiceHealth(
+            name=name,
+            type=service_type,
+            status="unhealthy",
             port=port,
             endpoint=None,
             response_time_ms=None,
-            error="No HTTP endpoint available"
+            error="TCP connection timeout"
+        )
+    except Exception as e:
+        return ServiceHealth(
+            name=name,
+            type=service_type,
+            status="unhealthy",
+            port=port,
+            endpoint=None,
+            response_time_ms=None,
+            error=f"TCP check failed: {str(e)}"
         )
 
-    # Check HTTP services
-    url = f"http://localhost:{port}{endpoint}"
+
+async def check_service_health(service: dict) -> ServiceHealth:
+    """Check health of a single service (HTTP or TCP)"""
+    name = service["name"]
+    host = service["host"]
+    port = service["port"]
+    endpoint = service["endpoint"]
+    service_type = service["type"]
+
+    # Services without HTTP endpoints - use TCP check
+    if endpoint is None:
+        return await check_tcp_health(host, port, name, service_type)
+
+    # Check HTTP services using Docker network IPs
+    url = f"http://{host}:{port}{endpoint}"
 
     try:
         start_time = asyncio.get_event_loop().time()
@@ -301,40 +361,47 @@ async def get_database_health():
     try:
         pool = await get_pool()
 
-        # Query table statistics from pg_stat_user_tables
-        # Note: This view shows statistics for user tables only
-        query = """
-            SELECT
-                schemaname as schema_name,
-                tablename as table_name,
-                n_live_tup as row_count,
-                last_vacuum as last_modified
-            FROM pg_stat_user_tables
-            WHERE schemaname IN ('superops', 'customer', 'audit', 'knowledge_base')
-            ORDER BY schemaname, tablename
-        """
-
-        rows = await pool.fetch(query)
-
-        # Build table stats
+        # Get table list and row counts
+        # Query each schema's tables individually
         tables = []
         schema_totals = {}
         total_records = 0
 
-        for row in rows:
-            schema_name = row['schema_name']
-            table_name = row['table_name']
-            row_count = row['row_count'] or 0
+        schemas = ['superops', 'customer', 'audit', 'knowledge_base']
 
-            tables.append(TableStats(
-                schema_name=schema_name,
-                table_name=table_name,
-                row_count=row_count,
-                last_modified=row['last_modified']
-            ))
+        for schema in schemas:
+            # Get tables in this schema
+            table_query = """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+            """
+            schema_tables = await pool.fetch(table_query, schema)
 
-            schema_totals[schema_name] = schema_totals.get(schema_name, 0) + row_count
-            total_records += row_count
+            schema_total = 0
+            for table_row in schema_tables:
+                table_name = table_row['table_name']
+
+                # Get row count for this table
+                try:
+                    count_query = f"SELECT COUNT(*) as count FROM {schema}.{table_name}"
+                    count_result = await pool.fetchrow(count_query)
+                    row_count = count_result['count'] or 0
+                except Exception as e:
+                    logger.warning(f"Could not count rows in {schema}.{table_name}: {e}")
+                    row_count = 0
+
+                tables.append(TableStats(
+                    schema_name=schema,
+                    table_name=table_name,
+                    row_count=row_count,
+                    last_modified=None  # Not easily available without additional queries
+                ))
+
+                schema_total += row_count
+                total_records += row_count
+
+            schema_totals[schema] = schema_total
 
         return DatabaseHealthResponse(
             schemas=schema_totals,

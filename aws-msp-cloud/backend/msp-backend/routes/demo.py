@@ -40,33 +40,69 @@ class DemoStatusResponse(BaseModel):
 @router.post("/start")
 async def start_demo(request: StartDemoRequest):
     """
-    Start continuous demo mode
+    Start continuous demo mode (Smart Start with auto-stop)
 
     This will:
-    1. Start the alert generator at specified rate
-    2. Track demo session for status queries
-    3. Allow frontend to show "live" mode
+    1. Check if alert generator is already running
+    2. Auto-stop if needed (prevents 400 Bad Request errors)
+    3. Start the alert generator at specified rate
+    4. Track demo session for status queries
+    5. Allow frontend to show "live" mode
     """
-    if demo_state.is_running:
-        raise HTTPException(status_code=400, detail="Demo already running. Stop first before starting new session.")
-
     try:
-        # Call alert generator /storm endpoint
         async with httpx.AsyncClient() as client:
-            # Storm endpoint generates at high rate for duration
-            # We'll use continuous mode instead if available
+            # Step 1: Check alert generator status first
+            status_response = await client.get(
+                "http://172.20.0.24:8003/status",
+                timeout=5.0
+            )
+
+            if status_response.status_code == 200:
+                status_data = status_response.json()
+
+                # Step 2: If already generating, stop first
+                if status_data.get("is_generating", False):
+                    logger.info(
+                        f"Alert generation already active at {status_data.get('current_rate', 'unknown')} alerts/min. "
+                        f"Auto-stopping before restart..."
+                    )
+
+                    stop_response = await client.post(
+                        "http://172.20.0.24:8003/stop",
+                        timeout=5.0
+                    )
+
+                    if stop_response.status_code != 200:
+                        logger.warning(f"Alert generator stop returned {stop_response.status_code}: {stop_response.text}")
+
+                    # Brief delay to ensure clean stop
+                    import asyncio
+                    await asyncio.sleep(0.5)
+
+                    logger.info("Alert generation stopped successfully. Starting fresh session...")
+
+            # Step 3: Start alert generation
             response = await client.post(
-                "http://172.20.0.24:8003/start",  # alert-generator IP
+                "http://172.20.0.24:8003/start",
                 json={
                     "rate_per_minute": request.rate_per_minute
                 },
                 timeout=5.0
             )
 
+            # Step 4: Handle errors with proper status codes
+            if response.status_code == 400:
+                # Should not happen after stop, but handle gracefully
+                raise HTTPException(
+                    status_code=409,  # Conflict (not 500)
+                    detail=f"Alert generator in unexpected state: {response.text}. "
+                           "Try pause/reset first, or contact support if issue persists."
+                )
+
             if response.status_code != 200:
                 raise HTTPException(
-                    status_code=500,
-                    detail=f"Alert generator failed to start: {response.text}"
+                    status_code=502,  # Bad Gateway (more accurate than 500)
+                    detail=f"Alert generator error ({response.status_code}): {response.text}"
                 )
 
         # Update demo state
@@ -101,7 +137,7 @@ async def pause_demo():
         # Call alert generator /stop endpoint
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "http://172.20.0.24:8003/stop",
+                "http://172.20.0.24:8003/stop",  # alert-generator IP
                 timeout=5.0
             )
 
@@ -138,7 +174,7 @@ async def reset_demo():
         # Stop alert generation first
         if demo_state.is_running:
             async with httpx.AsyncClient() as client:
-                await client.post("http://172.20.0.24:8003/stop", timeout=5.0)
+                await client.post("http://172.20.0.24:8003/stop", timeout=5.0)  # alert-generator IP
 
         # Reset demo state
         reset_time = demo_state.start_time or (datetime.now(timezone.utc) - timedelta(hours=1))
@@ -168,6 +204,111 @@ async def reset_demo():
     except Exception as e:
         logger.error(f"Error resetting demo: {e}")
         raise HTTPException(status_code=500, detail=f"Reset failed: {str(e)}")
+
+
+@router.post("/reset-full")
+async def reset_demo_full(confirm: bool = False):
+    """
+    Full reset: Delete ALL alerts, classifications, and action logs since 2025-11-01
+
+    This is a comprehensive reset that:
+    1. Stops alert generation if running
+    2. Deletes action_logs (no FK constraints)
+    3. Deletes ml_classifications (references alerts)
+    4. Deletes alerts (keeps seed data before 2025-11-01)
+    5. Resets demo state
+
+    WARNING: This will DELETE all alerts generated since Nov 1, 2025
+    Use only for demo/testing purposes
+
+    Args:
+        confirm: Must be True to proceed (safety check)
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Must set confirm=True to proceed with full reset"
+        )
+
+    try:
+        # Step 1: Stop alert generation first
+        if demo_state.is_running:
+            async with httpx.AsyncClient() as client:
+                await client.post("http://172.20.0.24:8003/stop", timeout=5.0)
+
+        # Step 2: Get cutoff date (Nov 1, 2025 - keeps seed data)
+        cutoff_date = datetime(2025, 11, 1, tzinfo=timezone.utc)
+
+        from database import get_pool
+        pool = await get_pool()
+
+        # Step 3: Delete in correct order (avoid FK violations)
+
+        # 3a. Delete action_logs (no FK constraints, safe to delete first)
+        action_logs_deleted = await pool.fetchval(
+            """
+            WITH deleted AS (
+                DELETE FROM audit.action_logs
+                WHERE timestamp >= $1
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM deleted
+            """,
+            cutoff_date
+        ) or 0
+
+        # 3b. Delete ml_classifications (references alerts via FK)
+        classifications_deleted = await pool.fetchval(
+            """
+            WITH deleted AS (
+                DELETE FROM superops.ml_classifications
+                WHERE created_at >= $1
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM deleted
+            """,
+            cutoff_date
+        ) or 0
+
+        # 3c. Delete alerts (keep seed data before Nov 1)
+        alerts_deleted = await pool.fetchval(
+            """
+            WITH deleted AS (
+                DELETE FROM superops.alerts
+                WHERE created_at >= $1
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM deleted
+            """,
+            cutoff_date
+        ) or 0
+
+        # Step 4: Reset demo state
+        demo_state.is_running = False
+        demo_state.start_time = None
+        demo_state.alerts_sent = 0
+
+        logger.info(
+            f"Full reset complete: {alerts_deleted} alerts, "
+            f"{classifications_deleted} classifications, {action_logs_deleted} action logs deleted"
+        )
+
+        return {
+            "status": "full_reset_complete",
+            "deleted": {
+                "alerts": alerts_deleted,
+                "ml_classifications": classifications_deleted,
+                "action_logs": action_logs_deleted
+            },
+            "cutoff_date": cutoff_date.isoformat(),
+            "message": "All demo data deleted. Seed data preserved. Ready for fresh demo."
+        }
+
+    except Exception as e:
+        logger.error(f"Error in full reset: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Full reset failed: {str(e)}")
 
 
 @router.get("/status", response_model=DemoStatusResponse)
